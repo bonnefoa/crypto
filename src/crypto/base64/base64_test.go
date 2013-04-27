@@ -2,7 +2,7 @@ package base64
 
 import "testing"
 import "testing/assert"
-import "encoding/hexa"
+import "crypto/hexa"
 
 func TestGroupBySize(t *testing.T) {
         res := groupBySix( []byte("Man") )

@@ -2,8 +2,8 @@ package xor
 
 import "testing"
 import "testing/assert"
-import "encoding/hexa"
-import "encoding/base64"
+import "crypto/base64"
+import "crypto/hexa"
 import "io/ioutil"
 
 func TestXor(t *testing.T) {
