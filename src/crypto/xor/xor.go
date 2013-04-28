@@ -10,24 +10,24 @@ import "crypto/hexa"
 import "utils/list"
 import "log"
 
-type Phrase struct {
+type XorCandidate struct {
         Source []byte
         Decrypted []byte
         Xor []byte
-        Score int
+        Score float32
 }
 
-func (phr Phrase) String() string {
-        return fmt.Sprintf("Decrypted %q, source %q, xor %q, score %d", phr.Decrypted,
-                phr.Source, phr.Xor, phr.Score)
+func (x XorCandidate) String() string {
+        return fmt.Sprintf("xor %x, score %f, Decrypted %q", x.Xor,
+                x.Score, x.Decrypted)
 }
 
-type Phrases []*Phrase
-type ByScore struct { Phrases }
+type XorCandidates []*XorCandidate
+type ByScore struct { XorCandidates }
 
-func (s Phrases) Len() int { return len(s) }
-func (s Phrases) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s ByScore) Less(i, j int) bool { return s.Phrases[i].Score > s.Phrases[j].Score }
+func (s XorCandidates) Len() int { return len(s) }
+func (s XorCandidates) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s ByScore) Less(i, j int) bool { return s.XorCandidates[i].Score > s.XorCandidates[j].Score }
 
 func Xor(src []byte, xor []byte) []byte {
         res := make([]byte, len(src))
@@ -37,56 +37,56 @@ func Xor(src []byte, xor []byte) []byte {
         return res
 }
 
-func ScoreText(src []byte) int {
+func ScoreText(src []byte) float32 {
         score := 0
         for _, r := range(bytes.Runes(src)) {
                 if unicode.IsLetter(r) {
                         score++
                 }
                 if unicode.IsLower(r) {
-                        score++
+                        score += 4
                 }
                 if unicode.IsSpace(r) {
-                        score += 4
+                        score += 30
                 }
                 if unicode.IsPunct(r) {
                         score -= 2
                 }
                 if unicode.IsSymbol(r) {
-                        score -= 2
+                        score -= 30
                 }
-                if !unicode.IsPrint(r) {
+                if !unicode.IsPrint(r) && !unicode.IsSpace(r) {
                         score -= 20
                 }
         }
-        return score
+        return float32(score) / float32(len(src))
 }
 
-func SeekXor(src []byte) Phrases {
-        phrases := make(Phrases, 0)
+func SeekXor(src []byte) XorCandidates {
+        xorCandidates := make(XorCandidates, 0)
         var i uint8
-        for i = 0; i < 255; i++ {
+        for i = 1; i < 255; i++ {
                 xors := []byte {byte(i)}
                 xored := Xor(src, xors)
-                phrase := new(Phrase)
-                *phrase = Phrase{src, xored, xors, ScoreText(xored)}
-                phrases = append(phrases, phrase)
+                xorCandidate := new(XorCandidate)
+                *xorCandidate = XorCandidate{src, xored, xors, ScoreText(xored)}
+                xorCandidates = append(xorCandidates, xorCandidate)
         }
-        sort.Sort(ByScore{phrases})
-        return phrases
+        sort.Sort(ByScore{xorCandidates})
+        return xorCandidates[0:5]
 }
 
-func SeekXorInFile(filename string) Phrases {
+func SeekXorInFile(filename string) XorCandidates {
         content, _ := ioutil.ReadFile(filename)
         lines := strings.Split(string(content), "\n")
-        phrases := make(Phrases, 0)
+        xorCandidates := make(XorCandidates, 0)
         for _, line := range lines {
-                for _, phrase := range SeekXor(hexa.HexaToBytes(line)) {
-                        phrases = append(phrases, phrase)
+                for _, xorCandidate := range SeekXor(hexa.HexaToBytes(line)) {
+                        xorCandidates = append(xorCandidates, xorCandidate)
                 }
         }
-        sort.Sort(ByScore{phrases})
-        return phrases
+        sort.Sort(ByScore{xorCandidates})
+        return xorCandidates
 }
 
 
@@ -125,12 +125,17 @@ func (s KeysizeGuesses) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 func (s KeysizeGuesses) Less(i, j int) bool { return s[i].normalized < s[j].normalized }
 
 func GuessProbableKeysize(min, max int, src []byte) KeysizeGuesses {
+        numBatch := 4
         guesses := make(KeysizeGuesses, 0)
         for i := min; i < max; i++ {
-                firstBatch := src[0:i]
-                secondBatch := src[i:i*2]
-                dist := HammingDistance(firstBatch, secondBatch)
-                normalized := float64(dist) / float64(i)
+                dist := 0
+                for j:=0; j < numBatch; j++ {
+                        offset := j*i
+                        firstBatch := src[offset:offset + i]
+                        secondBatch := src[offset + i:offset + i*2]
+                        dist += HammingDistance(firstBatch, secondBatch)
+                }
+                normalized := (float64(dist) / float64(i)) / float64(numBatch)
                 guess := new(KeysizeGuess)
                 *guess = KeysizeGuess{i, dist, normalized}
                 guesses = append(guesses, guess)
@@ -139,27 +144,64 @@ func GuessProbableKeysize(min, max int, src []byte) KeysizeGuesses {
         return guesses
 }
 
+func mergeXorCandidates(xorCandidates XorCandidates) *XorCandidate {
+        size := len(xorCandidates)
+        strSize := len(xorCandidates[0].Source)
 
-func GetHistograms(size int, src []byte) Phrases {
-        log.Printf("Trying key size %d \n", size)
-        sublists := list.Sublist(src, size)
-        blocks := make([][]byte, size)
-        for i:=0; i < size; i++ {
-                blocks[i] = make([]byte, len(sublists))
+        src := make([]byte, size * strSize)
+        decrypted := make([]byte, size * strSize)
+        xor := make([][]byte, 0)
+        score := float32(0)
+        for i, xorCandidate := range xorCandidates {
+                for j:=0; j < strSize; j++ {
+                        src[i + j * size] = xorCandidate.Source[j]
+                        decrypted[i + j * size] = xorCandidate.Decrypted[j]
+                }
+                xor = append(xor, xorCandidate.Xor)
+                score += xorCandidate.Score
         }
-        for i, subblock := range sublists {
+        xorCandidate := new(XorCandidate)
+        *xorCandidate = XorCandidate{src,
+                decrypted,
+                bytes.Join(xor, []byte{}), score}
+        return xorCandidate
+}
+
+func TransposeBlocks(src [][]byte) [][]byte {
+        n := len(src)
+        m := len(src[0])
+        blocks := make([][]byte, n)
+        for i:=0; i < n; i++ {
+                blocks[i] = make([]byte, m)
+        }
+        for i, subblock := range src {
                 for j, bt := range subblock {
                         blocks[j][i] = bt
                 }
         }
+        return blocks
+}
 
-        phrases := make(Phrases, size)
+func GuessRepeatXor(size int, src []byte) XorCandidates {
+        log.Printf("Trying key size %d \n", size)
+        sublists := list.Sublist(src, size)
+        blocks := TransposeBlocks(sublists)
+
+        xorCandidates := make(XorCandidates, 0)
+        xorBlocks := make([]XorCandidates, size)
         for i, subblock := range blocks {
                 candidates := SeekXor(subblock)
-                phrases[i] = candidates[0]
-                for j:=0; j < 3; j++ {
-                        log.Printf("Candidates %d for %d / %d : %s", j, i, size, candidates[j])
-                }
+                xorBlocks[i] = candidates
         }
-        return phrases
+        for i:=0; i < 3; i++ {
+                batch := make(XorCandidates, 0)
+                for j := 0; i < size; j++ {
+                        log.Printf("Got %d/%d\n", j, i)
+                        batch = append(batch, xorBlocks[j][i])
+                }
+                xorCandidates = append(xorCandidates,
+                        mergeXorCandidates(batch))
+        }
+        sort.Sort(ByScore{xorCandidates})
+        return xorCandidates
 }
